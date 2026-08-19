@@ -24,10 +24,11 @@ needing that configured by hand.
   use 2:1 (5x) by default or, optionally, 1:1 (2.5x). Other common source
   rates — e.g. 29.97fps (30000/1001) — are handled the same way, just
   scaled to whatever ratio lands cleanly on that fixed 59.94fps target.
-  Everything is then re-encoded (hardware-accelerated via Intel QSV/VAAPI
-  when available, falling back to CPU), with subtitles resynced/embedded
-  — including OCR (via `pgsrip` + Tesseract) for image-based PGS/Blu-ray
-  subtitle tracks.
+  Everything is then re-encoded (hardware-accelerated via Intel/AMD VAAPI,
+  Intel QSV, or NVIDIA NVENC when available, falling back to CPU — see
+  "Hardware encoding" below), with subtitles resynced/embedded — including
+  OCR (via `pgsrip` + Tesseract) for image-based PGS/Blu-ray subtitle
+  tracks.
 - Each input/output pair is tagged `movies` or `shows`, which tells
   `watch.py` which Radarr or Sonarr instance to ask for that title's
   original language. Speed and language can be overridden per-title with
@@ -45,8 +46,9 @@ needing that configured by hand.
   a dedicated root folder that titles you want abridged get imported
   into/moved to (this is how `watch.py` matches a file on disk back to a
   Radarr/Sonarr entry).
-- Optional: an Intel iGPU passed through as `/dev/dri` for QSV/VAAPI
-  hardware encode/decode. Falls back to CPU encoding otherwise.
+- Optional: a GPU for hardware encode/decode -- Intel or AMD via `/dev/dri`,
+  or NVIDIA via the NVIDIA Container Toolkit. Falls back to CPU encoding
+  otherwise. See "Hardware encoding" below.
 
 ## Setup
 
@@ -106,6 +108,28 @@ tag.
 | `RADARR_URL` / `RADARR_API_KEY` | Required for any pair with `"type": "movies"`. |
 | `SONARR_URL` / `SONARR_API_KEY` | Required for any pair with `"type": "shows"`. |
 | `ABRIDGE_CONFIG` | Path to the config file inside the container. Default `/config/config.json`. |
+| `ENCODER` | Hardware encoder vendor: `auto`, `qsv`, `vaapi`, `nvenc`, or `cpu`. Default `auto`. See "Hardware encoding" below. |
+| `VIDEO_CODEC` | Output video codec: `h264` or `hevc`. Default `h264`. |
+
+## Hardware encoding
+
+`ENCODER` picks the vendor, `VIDEO_CODEC` picks the output codec — the two
+are independent (e.g. `ENCODER=vaapi` + `VIDEO_CODEC=hevc` encodes
+`hevc_vaapi`). `auto` (the default) tries `qsv`, then `vaapi`, then
+`nvenc`, then `cpu`, falling back per-segment at runtime if a hardware
+encoder fails partway through a file — the codec never changes during
+that fallback, only the vendor does.
+
+| `ENCODER` | Hardware | Host requirements |
+|---|---|---|
+| `qsv` | Intel Quick Sync | `/dev/dri` passed through (see `docker-compose.example.yml`). |
+| `vaapi` | Intel **or** AMD | `/dev/dri` passed through. Same setting for both vendors — VAAPI is vendor-neutral, and this image bakes in both Intel's (`intel-media-va-driver-non-free`) and AMD's (`mesa-libgallium`, Mesa's `radeonsi` driver) open-source drivers already. |
+| `nvenc` | NVIDIA | The [NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) installed on the host, plus `runtime: nvidia` and `NVIDIA_VISIBLE_DEVICES`/`NVIDIA_DRIVER_CAPABILITIES` in compose (see the commented-out block in `docker-compose.example.yml`). NVIDIA's driver is proprietary and version-locked to the host, so unlike Intel/AMD it's never baked into the image — the toolkit injects it into the container at startup instead. |
+| `cpu` | none | Always available (`libx264`/`libx265`). |
+
+Whichever device gets passed through (`/dev/dri` or NVIDIA's), this image
+automatically ensures the container's `abc` user has the right permissions
+to access it — the same convention [linuxserver.io images](https://hub.docker.com/r/linuxserver/plex) use, no manual `chmod`/group setup needed on the host.
 
 ## Running `abridge.py` standalone
 

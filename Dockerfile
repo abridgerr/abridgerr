@@ -52,8 +52,22 @@ FROM ubuntu:26.04
 #   database TZ maps into, gosu to drop from root to the runtime user right
 #   before launching watch.py.
 ARG DEBIAN_FRONTEND=noninteractive
+# GPU hardware acceleration: QSV (Intel) and VAAPI (Intel AND AMD -- see
+# below) drivers are baked directly into the image, since both are
+# open-source/redistributable. NVENC (NVIDIA) needs NOTHING here at all --
+# ffmpeg's h264_nvenc/hevc_nvenc encoders are already compiled into this
+# distro's ffmpeg package (confirmed via `ffmpeg -buildconf`/`-encoders`),
+# and NVIDIA's own userspace driver library is deliberately never baked
+# into ANY image, this one included: unlike Intel's/Mesa's drivers it's
+# proprietary and tightly version-locked to the host, so it can only be
+# injected at container start by the NVIDIA Container Toolkit (host-side
+# install, not an image concern -- see docker-compose.example.yml). Do NOT
+# try to apt-get install an nvidia driver package here; that's not how
+# this works and would break portability for everyone not on that exact
+# driver version.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         intel-media-va-driver-non-free \
+        mesa-libgallium \
         vainfo \
         ffmpeg \
         tesseract-ocr \

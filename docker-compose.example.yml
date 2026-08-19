@@ -16,5 +16,43 @@ services:
       - RADARR_API_KEY=${RADARR_API_KEY}
       - SONARR_URL=http://sonarr:8989
       - SONARR_API_KEY=${SONARR_API_KEY}
+      # Hardware encoding -- see the README's "Hardware encoding" section.
+      # ENCODER (vendor): auto (default; tries qsv -> vaapi -> nvenc -> cpu
+      # in that order, falling back per-segment at runtime) / qsv / vaapi
+      # (also the AMD path, see `devices:` below) / nvenc (see the NVIDIA
+      # block further down) / cpu.
+      # VIDEO_CODEC (output codec): h264 (default) / hevc.
+      - ENCODER=auto
+      - VIDEO_CODEC=h264
+      # --- NVIDIA only -- uncomment these two AND `runtime: nvidia` below,
+      # and set ENCODER=nvenc above. Leave commented out for Intel/AMD
+      # (the plain `devices:` block below already covers both of those).
+      # NVIDIA_DRIVER_CAPABILITIES=all matters specifically because it
+      # includes "video" -- the default capability set on most NVIDIA
+      # base images is just "compute,utility", which is enough for CUDA
+      # workloads but NOT enough to expose libnvidia-encode/libnvcuvid,
+      # the libraries ffmpeg's nvenc/nvdec actually need.
+      # - NVIDIA_VISIBLE_DEVICES=all
+      # - NVIDIA_DRIVER_CAPABILITIES=all
     devices:
-      - /dev/dri:/dev/dri  # optional: Intel QSV/VAAPI passthrough
+      # Intel QSV/VAAPI *and* AMD VAAPI (Mesa's radeonsi driver) both come
+      # through this same /dev/dri render node -- there's no separate AMD
+      # device or ENCODER setting, "vaapi" already covers either vendor.
+      # Following the same convention linuxserver.io images use here: this
+      # image automatically ensures the abc user inside of the container
+      # has the proper permissions to access this device (see
+      # entrypoint.sh) -- nothing else to configure beyond mounting it.
+      # Omit this whole block if you're only using ENCODER=nvenc or cpu.
+      - /dev/dri:/dev/dri
+
+    # --- NVIDIA (NVENC) ---
+    # Requires the NVIDIA Container Toolkit installed on the host first:
+    # https://github.com/NVIDIA/nvidia-container-toolkit
+    # Then uncomment this (plus NVIDIA_VISIBLE_DEVICES/
+    # NVIDIA_DRIVER_CAPABILITIES and ENCODER=nvenc above). NVIDIA
+    # automatically mounts the GPU and its drivers from the host into the
+    # container -- this image additionally (defensively) makes sure the
+    # abc user has permission to access whatever device nodes that
+    # mounts, the same as it already does for /dev/dri above, though the
+    # toolkit normally leaves them world-accessible on its own.
+    # runtime: nvidia

@@ -935,14 +935,16 @@ def warn_once(key, message):
         _warned.add(key)
 
 
-def qsv_listed():
+def encoder_listed(vendor, video_codec):
+    """Whether f"{video_codec}_{vendor}" (e.g. "hevc_nvenc") is compiled
+    into this ffmpeg build -- a BUILD-capability check only, not a
+    real-hardware check (this image ships qsv/vaapi/nvenc support
+    together regardless of which GPU vendor is actually passed through at
+    runtime -- see the Dockerfile). Real hardware absence is instead
+    discovered lazily, per-segment, via the runtime failure/fallback
+    chain in cut_segment -- this just decides what to try first."""
     r = run(["ffmpeg", "-hide_banner", "-encoders"], capture=True)
-    return "h264_qsv" in r.stdout
-
-
-def vaapi_listed():
-    r = run(["ffmpeg", "-hide_banner", "-encoders"], capture=True)
-    return "h264_vaapi" in r.stdout
+    return f"{video_codec}_{vendor}" in r.stdout
 
 
 _NTSC_EXACT_FRACTIONS = {
@@ -1048,16 +1050,37 @@ def hwaccel_decode_args(encoder_mode):
         return ["-hwaccel", "qsv", "-hwaccel_device", "hw", "-hwaccel_output_format", "qsv"]
     if encoder_mode == "vaapi":
         return ["-hwaccel", "vaapi", "-hwaccel_device", "va", "-hwaccel_output_format", "vaapi"]
+    if encoder_mode == "nvenc":
+        # No -hwaccel_device here (unlike qsv/vaapi): a bare "cuda" device
+        # index of 0 is the right default for the common single-GPU
+        # passthrough case (NVIDIA_VISIBLE_DEVICES selects WHICH host
+        # GPU(s) the container can see at all; there's normally only one
+        # visible once that's set). No explicit -init_hw_device/
+        # -filter_hw_device is needed on the encode side either (see
+        # video_encode_args) -- decoded cuda frames' hw_frames_ctx
+        # propagates through the filter graph to nvenc automatically,
+        # unlike qsv/vaapi which both require an explicit device init.
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
     return []
 
 
 def video_encode_args(encoder_mode, speed=1.0, burn_srt_path=None, vaapi_device="/dev/dri/renderD128",
-                       hw_decode=False, crf=20, qsv_quality=23, vaapi_qp=23):
-    """crf/qsv_quality/vaapi_qp: per-encoder quality knobs (all lower = higher
-    quality, on roughly comparable ~1-51 scales), used the same way for
-    every re-encode call site -- per-segment cuts and the concat-fallback
-    re-encode alike -- since stream-copy concat (the default path) means
-    there's normally only ever one encode generation for any given frame.
+                       hw_decode=False, crf=20, qsv_quality=23, vaapi_qp=23, nvenc_cq=23,
+                       video_codec="h264"):
+    """crf/qsv_quality/vaapi_qp/nvenc_cq: per-encoder quality knobs (all
+    lower = higher quality, on roughly comparable ~1-51 scales), used the
+    same way for every re-encode call site -- per-segment cuts and the
+    concat-fallback re-encode alike -- since stream-copy concat (the
+    default path) means there's normally only ever one encode generation
+    for any given frame.
+    video_codec ("h264" or "hevc") selects WHAT to encode to; encoder_mode
+    selects the VENDOR doing it (qsv/vaapi/nvenc/cpu) -- orthogonal knobs,
+    see --video-codec/--encoder. qsv/vaapi/nvenc all name their encoder as
+    f"{video_codec}_{encoder_mode}" (e.g. "hevc_vaapi"), which is why AMD
+    needs no separate vendor of its own here: it's the exact same VAAPI
+    device/encoder names as Intel, just backed by Mesa's radeonsi driver
+    instead of Intel's iHD one for whichever GPU /dev/dri actually points
+    at (see the Dockerfile).
     No target-fps/-r/-fps_mode forcing here: speeds are restricted to exact
     small-integer frame-rate ratios (see resolve_frame_rate_strategy), so
     every segment's frames already land exactly on the target rate by
@@ -1084,54 +1107,102 @@ def video_encode_args(encoder_mode, speed=1.0, burn_srt_path=None, vaapi_device=
         global_args = ["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"]
         if not skip_upload:
             vf_parts.append("format=nv12,hwupload=qsv")
-        codec_args = ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", str(qsv_quality), "-bf", "0"]
+        codec_args = ["-c:v", f"{video_codec}_qsv", "-preset", "veryfast", "-global_quality", str(qsv_quality), "-bf", "0"]
     elif encoder_mode == "vaapi":
         global_args = ["-init_hw_device", f"vaapi=va:{vaapi_device}", "-filter_hw_device", "va"]
         if not skip_upload:
             vf_parts.append("format=nv12,hwupload")
-        codec_args = ["-c:v", "h264_vaapi", "-qp", str(vaapi_qp), "-bf", "0"]
+        codec_args = ["-c:v", f"{video_codec}_vaapi", "-qp", str(vaapi_qp), "-bf", "0"]
+    elif encoder_mode == "nvenc":
+        # No -init_hw_device/-filter_hw_device (unlike qsv/vaapi): nvenc
+        # accepts either plain software frames or an already-cuda
+        # hw_frames_ctx from decode (see hwaccel_decode_args) without
+        # needing an explicit device/filter graph setup either way -- one
+        # of the few genuine simplifications nvenc has over qsv/vaapi, not
+        # an oversight. -rc vbr -cq (rather than -rc constqp -qp, the
+        # closer analogue to vaapi's -qp) is nvenc's own recommended
+        # constant-quality mode -- constqp fixes every frame to the same
+        # QP regardless of complexity, while vbr+cq lets the rate
+        # controller vary bitrate per-frame around that quality target,
+        # which is what actually behaves like libx264's -crf/vaapi's -qp
+        # in practice (comparable output size for comparable content).
+        global_args = []
+        codec_args = ["-c:v", f"{video_codec}_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", str(nvenc_cq), "-bf", "0"]
     else:
         global_args = []
-        codec_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-bf", "0"]
+        libx = "libx264" if video_codec == "h264" else "libx265"
+        codec_args = ["-c:v", libx, "-preset", "veryfast", "-crf", str(crf), "-bf", "0"]
 
     vf = ",".join(vf_parts) if vf_parts else None
     return global_args, vf, codec_args
 
 
-def resolve_encoder(requested):
+def _fallback_encoder_mode(mode, video_codec):
+    """Next vendor to try after `mode` fails at runtime (used by both
+    cut_segment's per-segment retry and the concat-fallback re-encode
+    loop), or "cpu" if there's nowhere further to fall back to. Only qsv
+    chains onward to vaapi -- both are Intel-only paths sharing the same
+    /dev/dri device, so a qsv failure with a real Intel iGPU present often
+    still has vaapi work (see --encoder's help text). vaapi and nvenc both
+    fall straight to cpu instead of trying each other: a failure there
+    means that vendor's own device/runtime is broken, not that some OTHER
+    GPU vendor happens to be reachable instead, so trying a second
+    hardware vendor blind is unlikely to help and just costs another
+    failed attempt."""
+    if mode == "qsv":
+        return "vaapi" if encoder_listed("vaapi", video_codec) else "cpu"
+    return "cpu"
+
+
+def resolve_encoder(requested, video_codec):
     if requested == "cpu":
-        print("Using libx264 (CPU) encoding.")
+        print(f"Using {'libx264' if video_codec == 'h264' else 'libx265'} (CPU) encoding.")
         return "cpu"
 
     if requested == "qsv":
-        if qsv_listed():
-            print("Using Intel QSV (h264_qsv) for hardware-accelerated encoding "
+        if encoder_listed("qsv", video_codec):
+            print(f"Using Intel QSV ({video_codec}_qsv) for hardware-accelerated encoding "
                   "(will auto-fallback to VAAPI, then CPU, per-segment if it fails at runtime).")
             return "qsv"
-        print("[!] h264_qsv is not compiled into this ffmpeg build.")
-        if vaapi_listed():
-            print("Falling back to VAAPI (h264_vaapi) instead.")
+        print(f"[!] {video_codec}_qsv is not compiled into this ffmpeg build.")
+        if encoder_listed("vaapi", video_codec):
+            print(f"Falling back to VAAPI ({video_codec}_vaapi) instead.")
             return "vaapi"
-        print("VAAPI isn't available either -- falling back to libx264 (CPU).")
+        print("VAAPI isn't available either -- falling back to CPU.")
         return "cpu"
 
     if requested == "vaapi":
-        if vaapi_listed():
-            print("Using VAAPI (h264_vaapi) for hardware-accelerated encoding "
+        if encoder_listed("vaapi", video_codec):
+            print(f"Using VAAPI ({video_codec}_vaapi) for hardware-accelerated encoding -- this is also the "
+                  "path AMD GPUs use (Mesa's radeonsi driver backing the same /dev/dri device, no separate "
+                  "vendor setting needed) "
                   "(will auto-fallback to CPU per-segment if it fails at runtime).")
             return "vaapi"
-        print("[!] h264_vaapi is not compiled into this ffmpeg build -- falling back to libx264 (CPU).")
+        print(f"[!] {video_codec}_vaapi is not compiled into this ffmpeg build -- falling back to CPU.")
         return "cpu"
 
-    if qsv_listed():
-        print("Using Intel QSV (h264_qsv) for hardware-accelerated encoding "
+    if requested == "nvenc":
+        if encoder_listed("nvenc", video_codec):
+            print(f"Using NVIDIA NVENC ({video_codec}_nvenc) for hardware-accelerated encoding "
+                  "(requires the NVIDIA Container Toolkit on the host -- see the compose file) "
+                  "(will auto-fallback to CPU per-segment if it fails at runtime).")
+            return "nvenc"
+        print(f"[!] {video_codec}_nvenc is not compiled into this ffmpeg build -- falling back to CPU.")
+        return "cpu"
+
+    if encoder_listed("qsv", video_codec):
+        print(f"Using Intel QSV ({video_codec}_qsv) for hardware-accelerated encoding "
               "(will auto-fallback to VAAPI, then CPU, per-segment if it fails at runtime).")
         return "qsv"
-    if vaapi_listed():
-        print("h264_qsv not available in this ffmpeg build, using VAAPI (h264_vaapi) instead "
-              "(will auto-fallback to CPU per-segment if it fails at runtime).")
+    if encoder_listed("vaapi", video_codec):
+        print(f"{video_codec}_qsv not available in this ffmpeg build, using VAAPI ({video_codec}_vaapi) instead "
+              "(also the AMD path -- will auto-fallback to CPU per-segment if it fails at runtime).")
         return "vaapi"
-    print("Neither QSV nor VAAPI available in this ffmpeg build, using libx264 (CPU).")
+    if encoder_listed("nvenc", video_codec):
+        print(f"Neither QSV nor VAAPI available, using NVIDIA NVENC ({video_codec}_nvenc) instead "
+              "(will auto-fallback to CPU per-segment if it fails at runtime).")
+        return "nvenc"
+    print("No hardware encoder available in this ffmpeg build, using CPU.")
     return "cpu"
 
 
@@ -1236,8 +1307,8 @@ def verify_and_fix_frame_count(seg_path, expected_frames):
 def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cpu",
                  vaapi_device="/dev/dri/renderD128", audio_stream_index=None, audio_channels=None,
                  burn_srt_path=None, target_fps=None, hw_decode=False, surround_fix=None,
-                 crf=14, qsv_quality=16, vaapi_qp=16, is_final_segment=False,
-                 source_fps_frac=None, debug_speed_overlay=False):
+                 crf=14, qsv_quality=16, vaapi_qp=16, nvenc_cq=16, video_codec="h264",
+                 is_final_segment=False, source_fps_frac=None, debug_speed_overlay=False):
     duration = end - start
     map_args = ["-map", "0:v:0"]
     if audio_stream_index is not None:
@@ -1303,10 +1374,11 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
         rate_prefix = ""
         ve_speed = speed
 
-    effective_hw_decode = hw_decode and encoder_mode in ("qsv", "vaapi")
+    effective_hw_decode = hw_decode and encoder_mode in ("qsv", "vaapi", "nvenc")
     global_args, vf, codec_args = video_encode_args(encoder_mode, ve_speed, burn_srt_path, vaapi_device,
                                                       hw_decode=effective_hw_decode,
-                                                      crf=crf, qsv_quality=qsv_quality, vaapi_qp=vaapi_qp)
+                                                      crf=crf, qsv_quality=qsv_quality, vaapi_qp=vaapi_qp,
+                                                      nvenc_cq=nvenc_cq, video_codec=video_codec)
     decode_args = hwaccel_decode_args(encoder_mode) if effective_hw_decode else []
 
     # Frame-exact trimming. Repeated attempts trusting ffmpeg's -ss/-t to
@@ -1464,33 +1536,28 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     if r.returncode != 0:
         if _interrupted.is_set():
             raise RuntimeError(f"ffmpeg interrupted on segment {start}-{end}")
-        if encoder_mode == "qsv":
-            next_mode = "vaapi" if vaapi_listed() else "cpu"
+        if encoder_mode in ("qsv", "vaapi", "nvenc"):
+            next_mode = _fallback_encoder_mode(encoder_mode, video_codec)
             stderr_tail = (r.stderr or "").strip().splitlines()
-            print(f"  [!] h264_qsv failed at runtime on segment {start:.2f}-{end:.2f}s, retrying with "
-                  f"{next_mode}: {stderr_tail[-1] if stderr_tail else '(no stderr)'}")
-            warn_once("qsv", "      (other segments still try QSV first -- this isn't a persistent downgrade "
-                              "for the rest of the run. Check Intel media driver / oneVPL runtime / /dev/dri "
-                              "access if this recurs often, or GPU contention if --jobs is high.)")
+            hint = {
+                "qsv": "Check Intel media driver / oneVPL runtime / /dev/dri access if this recurs often, "
+                       "or GPU contention if --jobs is high.",
+                "vaapi": "Check the VAAPI driver (intel-media-va-driver-non-free for Intel, mesa-libgallium "
+                         "for AMD) / /dev/dri access if this recurs often.",
+                "nvenc": "Check the NVIDIA Container Toolkit / NVIDIA_VISIBLE_DEVICES / host driver install "
+                         "if this recurs often -- or the concurrent-session limit some consumer GPUs "
+                         "enforce, if --jobs is high.",
+            }[encoder_mode]
+            print(f"  [!] {video_codec}_{encoder_mode} failed at runtime on segment {start:.2f}-{end:.2f}s, "
+                  f"retrying with {next_mode}: {stderr_tail[-1] if stderr_tail else '(no stderr)'}")
+            warn_once(encoder_mode, f"      (other segments still try {encoder_mode.upper()} first -- this "
+                                     f"isn't a persistent downgrade for the rest of the run. {hint})")
             cut_segment(src, start, end, out_path, reencode=True, speed=speed, encoder_mode=next_mode,
                         vaapi_device=vaapi_device, audio_stream_index=audio_stream_index,
                         audio_channels=audio_channels, burn_srt_path=burn_srt_path,
                         target_fps=target_fps, hw_decode=hw_decode, surround_fix=surround_fix,
-                        crf=crf, qsv_quality=qsv_quality, vaapi_qp=vaapi_qp, is_final_segment=is_final_segment,
-                        source_fps_frac=source_fps_frac, debug_speed_overlay=debug_speed_overlay)
-            return
-        if encoder_mode == "vaapi":
-            stderr_tail = (r.stderr or "").strip().splitlines()
-            print(f"  [!] h264_vaapi failed at runtime on segment {start:.2f}-{end:.2f}s, retrying with "
-                  f"libx264/CPU: {stderr_tail[-1] if stderr_tail else '(no stderr)'}")
-            warn_once("vaapi", "      (other segments still try VAAPI first -- this isn't a persistent "
-                                "downgrade for the rest of the run. Check Intel media driver / /dev/dri "
-                                "access if this recurs often.)")
-            cut_segment(src, start, end, out_path, reencode=True, speed=speed, encoder_mode="cpu",
-                        audio_stream_index=audio_stream_index, audio_channels=audio_channels,
-                        burn_srt_path=burn_srt_path, target_fps=target_fps,
-                        hw_decode=hw_decode, surround_fix=surround_fix,
-                        crf=crf, qsv_quality=qsv_quality, vaapi_qp=vaapi_qp, is_final_segment=is_final_segment,
+                        crf=crf, qsv_quality=qsv_quality, vaapi_qp=vaapi_qp, nvenc_cq=nvenc_cq,
+                        video_codec=video_codec, is_final_segment=is_final_segment,
                         source_fps_frac=source_fps_frac, debug_speed_overlay=debug_speed_overlay)
             return
         raise RuntimeError(f"ffmpeg failed on segment {start}-{end}:\n{r.stderr[-2000:]}")
@@ -1614,7 +1681,7 @@ def process_one_dialog_mode(input_path, output_path, args, encoder_mode, vaapi_d
         else:
             print("No audio track found in input -- output will be video-only.")
 
-        hw_decode = not args.no_hw_decode and encoder_mode in ("qsv", "vaapi")
+        hw_decode = not args.no_hw_decode and encoder_mode in ("qsv", "vaapi", "nvenc")
         if hw_decode:
             source_codec = get_source_video_codec(input_path)
             if source_codec in _HW_DECODE_UNRELIABLE_CODECS:
@@ -1689,6 +1756,7 @@ def process_one_dialog_mode(input_path, output_path, args, encoder_mode, vaapi_d
                         audio_stream_index=audio_abs_index, audio_channels=channels_int, target_fps=new_target_fps,
                         hw_decode=hw_decode, surround_fix=surround_fix,
                         crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                        nvenc_cq=args.nvenc_cq, video_codec=args.video_codec,
                         is_final_segment=True, source_fps_frac=source_fps_frac)
 
             if sub_entries:
@@ -1794,7 +1862,7 @@ def process_one(input_path, output_path, args, encoder_mode, vaapi_device):
         if target_fps:
             print(f"Forcing constant {target_fps:.3f}fps output on every re-encoded segment (use --fps 0 to disable).")
 
-        hw_decode = not args.no_hw_decode and encoder_mode in ("qsv", "vaapi")
+        hw_decode = not args.no_hw_decode and encoder_mode in ("qsv", "vaapi", "nvenc")
         if hw_decode:
             source_codec = get_source_video_codec(input_path)
             if source_codec in _HW_DECODE_UNRELIABLE_CODECS:
@@ -2028,6 +2096,7 @@ def process_one(input_path, output_path, args, encoder_mode, vaapi_device):
                             burn_srt_path=burn_path, target_fps=target_fps,
                             hw_decode=hw_decode, surround_fix=surround_fix,
                             crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                            nvenc_cq=args.nvenc_cq, video_codec=args.video_codec,
                             is_final_segment=is_final_segment, source_fps_frac=source_fps_frac,
                             debug_speed_overlay=args.debug_speed_overlay)
             elif args.fast_copy and speed_factor == 1.0 and not target_fps:
@@ -2042,6 +2111,7 @@ def process_one(input_path, output_path, args, encoder_mode, vaapi_device):
                                 audio_channels=channels_int,
                                 target_fps=target_fps, hw_decode=hw_decode, surround_fix=surround_fix,
                                 crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                                nvenc_cq=args.nvenc_cq, video_codec=args.video_codec,
                                 is_final_segment=is_final_segment, source_fps_frac=source_fps_frac,
                                 debug_speed_overlay=args.debug_speed_overlay)
             else:
@@ -2050,6 +2120,7 @@ def process_one(input_path, output_path, args, encoder_mode, vaapi_device):
                             audio_channels=channels_int,
                             target_fps=target_fps, hw_decode=hw_decode, surround_fix=surround_fix,
                             crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                            nvenc_cq=args.nvenc_cq, video_codec=args.video_codec,
                             is_final_segment=is_final_segment, source_fps_frac=source_fps_frac,
                             debug_speed_overlay=args.debug_speed_overlay)
             return i, get_duration(seg_path)
@@ -2217,17 +2288,19 @@ def process_one(input_path, output_path, args, encoder_mode, vaapi_device):
                 print("Stream-copy concat failed, re-encoding on concat (slower)...")
                 concat_mode = encoder_mode
                 global_args, vf, codec_args = video_encode_args(concat_mode, speed=1.0, vaapi_device=vaapi_device,
-                                                                  crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp)
+                                                                  crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                                                                  nvenc_cq=args.nvenc_cq, video_codec=args.video_codec)
                 cmd = ["ffmpeg", "-nostdin", "-y"] + global_args + ["-f", "concat", "-safe", "0", "-i", concat_list_path]
                 if vf:
                     cmd += ["-vf", vf]
                 cmd += codec_args + ["-c:a", "aac", "-b:a", audio_bitrate_for_channels(channels_int), target_video]
                 r = run(cmd)
                 while r.returncode != 0 and concat_mode != "cpu":
-                    concat_mode = "vaapi" if concat_mode == "qsv" and vaapi_listed() else "cpu"
+                    concat_mode = _fallback_encoder_mode(concat_mode, args.video_codec)
                     print(f"  [!] Concat re-encode failed, retrying with {concat_mode}...")
                     global_args, vf, codec_args = video_encode_args(concat_mode, speed=1.0, vaapi_device=vaapi_device,
-                                                                      crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp)
+                                                                      crf=args.crf, qsv_quality=args.qsv_quality, vaapi_qp=args.vaapi_qp,
+                                                                      nvenc_cq=args.nvenc_cq, video_codec=args.video_codec)
                     cmd = ["ffmpeg", "-nostdin", "-y"] + global_args + ["-f", "concat", "-safe", "0", "-i", concat_list_path]
                     if vf:
                         cmd += ["-vf", vf]
@@ -2392,24 +2465,39 @@ def main():
     ap.add_argument("--list-audio", action="store_true", help="List audio tracks in the input and exit (single-file mode only)")
     ap.add_argument("--lang", default=None, help="Language code (e.g. 'eng', 'spa', matching the track's language tag) to auto-select the audio and/or subtitle track, when exactly one track of that language exists -- skips the interactive prompt/error that would otherwise happen with multiple tracks. Explicit --audio-track/--sub-track still take priority if given. Especially useful in batch mode, where track indices may not be consistent across files but language tags usually are.")
     ap.add_argument("--fast-copy", action="store_true", help="Stream-copy dialog segments instead of re-encoding them (faster/lighter, but cut points can drift to the nearest source keyframe; ignored for segments using --burn-subs, which always re-encodes)")
-    ap.add_argument("--encoder", choices=["auto", "qsv", "vaapi", "cpu"], default="auto",
-                     help="Video encoder: 'qsv' for Intel Quick Sync, 'vaapi' for Intel VAAPI "
-                          "(often works when QSV doesn't, e.g. missing oneVPL/libmfx runtime), "
-                          "'cpu' for libx264, 'auto' (default) tries qsv, then vaapi, then cpu, "
-                          "falling back per-segment at runtime if a hardware encoder fails")
+    ap.add_argument("--video-codec", choices=["h264", "hevc"], default="h264",
+                     help="Output video codec (default h264). Orthogonal to --encoder: this picks WHAT to "
+                          "encode to, --encoder picks WHO does it (Intel/AMD/NVIDIA/CPU) -- e.g. "
+                          "--video-codec hevc --encoder vaapi encodes hevc_vaapi. Every vendor's hardware "
+                          "fallback chain (see --encoder) keeps the codec fixed and only changes vendor -- "
+                          "a hevc request never silently downgrades to h264 output.")
+    ap.add_argument("--encoder", choices=["auto", "qsv", "vaapi", "nvenc", "cpu"], default="auto",
+                     help="Video encoder VENDOR: 'qsv' for Intel Quick Sync, 'vaapi' for Intel VAAPI "
+                          "(often works when QSV doesn't, e.g. missing oneVPL/libmfx runtime) -- also the "
+                          "path AMD GPUs use, since VAAPI is vendor-neutral (Mesa's radeonsi driver backs "
+                          "the same /dev/dri device on AMD, no separate 'amd' setting exists or is needed), "
+                          "'nvenc' for NVIDIA (requires the NVIDIA Container Toolkit on the host -- see the "
+                          "compose file), 'cpu' for software libx264/libx265, 'auto' (default) tries qsv, "
+                          "then vaapi, then nvenc, then cpu, falling back per-segment at runtime if a "
+                          "hardware encoder fails (see --video-codec for why the chosen codec never changes "
+                          "mid-fallback, only the vendor does)")
     ap.add_argument("--vaapi-device", default="/dev/dri/renderD128", help="VAAPI render device path (default /dev/dri/renderD128; check `ls /dev/dri` if you have multiple GPUs)")
-    ap.add_argument("--jobs", type=int, default=4, help="Number of segments to cut/encode in parallel within a single file (default 4). Each segment's decode+filter stage is CPU-bound and independent of the others, so this parallelizes well across cores; hardware encode (QSV/VAAPI) also handles a queue of concurrent requests fine since Intel doesn't cap concurrent sessions the way consumer Nvidia cards do. Raise it on many-core machines, lower it (e.g. 1-2) if using --encoder cpu on a low core count.")
-    ap.add_argument("--no-hw-decode", action="store_true", help="Disable hardware-accelerated decode. By default, whenever QSV/VAAPI encoding is used, decode also runs on the same device so frames never leave the GPU (except around --burn-subs, which needs software frames for subtitle rendering); a decode failure at runtime falls back the same way an encode failure does (qsv -> vaapi -> cpu). Pass this to force software decode instead.")
+    ap.add_argument("--jobs", type=int, default=4, help="Number of segments to cut/encode in parallel within a single file (default 4). Each segment's decode+filter stage is CPU-bound and independent of the others, so this parallelizes well across cores; hardware encode (QSV/VAAPI) also handles a queue of concurrent requests fine since Intel doesn't cap concurrent sessions the way consumer GPUs traditionally have. Lower it (e.g. 1-2) with --encoder nvenc if you hit a concurrent-session limit, or with --encoder cpu on a low core count.")
+    ap.add_argument("--no-hw-decode", action="store_true", help="Disable hardware-accelerated decode. By default, whenever QSV/VAAPI/NVENC encoding is used, decode also runs on the same device so frames never leave the GPU (except around --burn-subs, which needs software frames for subtitle rendering); a decode failure at runtime falls back the same way an encode failure does (qsv -> vaapi -> cpu; nvenc -> cpu). Pass this to force software decode instead.")
 
     ap.add_argument("--crf", type=int, default=20,
-                     help="[libx264] CRF used for every re-encode -- per-segment cuts and the concat "
-                          "fallback re-encode alike (default 20). Lower = higher quality/larger file.")
+                     help="[CPU: libx264/libx265, see --video-codec] CRF used for every re-encode -- "
+                          "per-segment cuts and the concat fallback re-encode alike (default 20). Lower = "
+                          "higher quality/larger file.")
     ap.add_argument("--qsv-quality", type=int, default=23,
                      help="[QSV] global_quality used for every re-encode (default 23, roughly comparable "
                           "scale to --crf). Lower = higher quality.")
     ap.add_argument("--vaapi-qp", type=int, default=23,
-                     help="[VAAPI] qp used for every re-encode (default 23, roughly comparable scale to "
-                          "--crf). Lower = higher quality.")
+                     help="[VAAPI, Intel or AMD] qp used for every re-encode (default 23, roughly comparable "
+                          "scale to --crf). Lower = higher quality.")
+    ap.add_argument("--nvenc-cq", type=int, default=23,
+                     help="[NVENC] constant-quality target (-rc vbr -cq) used for every re-encode (default "
+                          "23, roughly comparable scale to --crf). Lower = higher quality.")
     ap.add_argument("--dump-segments", nargs="?", const="", default=None, metavar="DIR",
                      help="Copy each pre-concat segment file to DIR (created if needed) for standalone "
                           "inspection -- e.g. to check whether a glitch is already present in an individual "
@@ -2491,7 +2579,7 @@ def main():
                       "(Only .mkv inputs are supported in batch mode.)")
 
         print(f"Batch mode: found {len(input_files)} .mkv file(s) in {args.input} (including subfolders)")
-        encoder_mode = resolve_encoder(args.encoder)
+        encoder_mode = resolve_encoder(args.encoder, args.video_codec)
         vaapi_device = args.vaapi_device
 
         results = []
@@ -2549,7 +2637,7 @@ def main():
                 print(describe_audio_track(i, t))
         return
 
-    encoder_mode = resolve_encoder(args.encoder)
+    encoder_mode = resolve_encoder(args.encoder, args.video_codec)
     vaapi_device = args.vaapi_device
 
     # Output is always treated as a destination FOLDER, never a specific

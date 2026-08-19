@@ -99,6 +99,17 @@ from watchdog.observers import Observer
 KNOWN_PAIR_FIELDS = {"input", "output", "type", "default_speed", "log_level", "extra_args"}
 LOG_LEVELS = {"error", "debug", "info", "none"}
 
+# Container-wide (not per-pair) hardware-encoding choice, passed straight
+# through to every abridge.py invocation as --encoder/--video-codec -- see
+# docker-compose.example.yml for the values and what each requires on the
+# host. Validated once here, at startup (see main()), rather than letting
+# an unrecognized value surface as the same argparse error on every single
+# file processed -- same reasoning as resolve_arr_env's up-front check.
+ENCODER_CHOICES = {"auto", "qsv", "vaapi", "nvenc", "cpu"}
+VIDEO_CODEC_CHOICES = {"h264", "hevc"}
+ENCODER = os.environ.get("ENCODER", "auto")
+VIDEO_CODEC = os.environ.get("VIDEO_CODEC", "h264")
+
 # Selects which Radarr/Sonarr env vars a pair's "type" maps to -- see the
 # module docstring and resolve_arr_overrides.
 ARR_ENV_BY_TYPE = {
@@ -478,9 +489,16 @@ def check_and_process_file(f, pair, min_free_gb):
 
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}): {f}")
+        log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}, "
+            f"encoder={ENCODER}, video_codec={VIDEO_CODEC}): {f}")
+        # ENCODER/VIDEO_CODEC come before extra_args, not after: argparse
+        # keeps the LAST occurrence of a repeated flag, so a pair's own
+        # extra_args (e.g. ["--encoder", "cpu"] for one pair that needs to
+        # skip hardware encode) can still override these container-wide
+        # defaults on a per-pair basis.
         cmd = ([sys.executable, "/app/abridge.py", str(f), str(out_dir),
-                "--speed", speed, "--lang", lang, "--embed-subs"] + pair["extra_args"])
+                "--speed", speed, "--lang", lang, "--embed-subs",
+                "--encoder", ENCODER, "--video-codec", VIDEO_CODEC] + pair["extra_args"])
         start = time.monotonic()
         returncode, output_text = run_abridge(cmd)
         elapsed = time.monotonic() - start
@@ -535,6 +553,13 @@ class DebouncedPairWatcher(FileSystemEventHandler):
 
 
 def main():
+    if ENCODER not in ENCODER_CHOICES:
+        sys.exit(f"ENCODER={ENCODER!r} is not one of {sorted(ENCODER_CHOICES)} -- fix the environment "
+                  f"variable (see docker-compose.example.yml).")
+    if VIDEO_CODEC not in VIDEO_CODEC_CHOICES:
+        sys.exit(f"VIDEO_CODEC={VIDEO_CODEC!r} is not one of {sorted(VIDEO_CODEC_CHOICES)} -- fix the "
+                  f"environment variable (see docker-compose.example.yml).")
+
     config_path = Path(os.environ.get("ABRIDGE_CONFIG", "/config/config.json"))
     config = load_config(config_path)
 
