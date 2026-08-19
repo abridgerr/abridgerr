@@ -46,7 +46,20 @@ configured by hand.
 2. Copy `docker-compose.example.yml` to `docker-compose.yml` (or add the
    service to your existing stack), set your media mount path, and set
    `RADARR_API_KEY`/`SONARR_API_KEY` (e.g. via a `.env` file).
-3. `docker compose up -d --build`
+3. `docker compose up -d` — this pulls the published
+   `ghcr.io/abridgerr/abridgerr:latest` image. Swap in `build: .` instead
+   if you'd rather build it yourself from this repo.
+
+## Image
+
+Published automatically on every push to `master` via GitHub Actions:
+
+```
+ghcr.io/abridgerr/abridgerr:latest
+```
+
+Tagged images (`vX.Y.Z`) are also published for any pushed `v*.*.*` git
+tag.
 
 ## config.json
 

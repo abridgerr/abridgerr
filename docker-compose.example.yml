@@ -1,8 +1,8 @@
 services:
   abridgerr:
-    build: .
-    # or, once you're pulling a published image instead of building locally:
-    # image: ghcr.io/<you>/abridgerr:latest
+    image: ghcr.io/abridgerr/abridgerr:latest
+    # or build it yourself instead of pulling:
+    # build: .
     container_name: abridgerr
     restart: unless-stopped
     volumes:
