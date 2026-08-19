@@ -1,11 +1,14 @@
 # abridgerr
 
-Watches a folder for `.mkv` files and re-encodes each one with the
-no-dialog stretches sped up (2x by default) while dialog stays at normal
-speed, resyncing subtitles to the new timeline. Runs as a long-lived
-Docker container that hooks into Radarr/Sonarr to figure out each title's
-language and any per-title speed override, rather than needing that
-configured by hand.
+Watches a folder for `.mkv` files and re-encodes each one onto a fixed
+59.94fps (60000/1001) timeline, speeding up dialog and non-dialog stretches
+by different amounts rather than leaving dialog untouched: dialog plays a
+gentle 1.25x faster (a 1:2 source-to-output frame ratio), while non-dialog
+stretches jump to 5x by default or 2.5x optionally (2:1 or 1:1 frame
+ratios) — all resyncing subtitles to the new timeline. Runs as a
+long-lived Docker container that hooks into Radarr/Sonarr to figure out
+each title's language and any per-title speed override, rather than
+needing that configured by hand.
 
 ## How it works
 
@@ -14,10 +17,17 @@ configured by hand.
   events (i.e. a copy/download has actually finished), it hands the file
   to `abridge.py` and writes the result into the matching output folder.
 - `abridge.py` does the actual work: detects dialog vs. non-dialog
-  segments, speeds up the non-dialog ones, re-encodes (hardware-accelerated
-  via Intel QSV/VAAPI when available, falling back to CPU), and resyncs/
-  embeds subtitles — including OCR (via `pgsrip` + Tesseract) for
-  image-based PGS/Blu-ray subtitle tracks.
+  segments and re-times each onto a fixed 59.94fps (60000/1001) output
+  timeline using exact source-to-output frame ratios rather than a
+  continuous speed multiplier. For a standard 23.976fps (24000/1001)
+  source, dialog segments use a 1:2 ratio (1.25x), and non-dialog segments
+  use 2:1 (5x) by default or, optionally, 1:1 (2.5x). Other common source
+  rates — e.g. 29.97fps (30000/1001) — are handled the same way, just
+  scaled to whatever ratio lands cleanly on that fixed 59.94fps target.
+  Everything is then re-encoded (hardware-accelerated via Intel QSV/VAAPI
+  when available, falling back to CPU), with subtitles resynced/embedded
+  — including OCR (via `pgsrip` + Tesseract) for image-based PGS/Blu-ray
+  subtitle tracks.
 - Each input/output pair is tagged `movies` or `shows`, which tells
   `watch.py` which Radarr or Sonarr instance to ask for that title's
   original language. Speed and language can be overridden per-title with
