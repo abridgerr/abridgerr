@@ -1,0 +1,19 @@
+{
+    "min_free_gb": 20,
+    "pairs": [
+        {
+            "input": "/mnt/media/toabridge-movies",
+            "output": "/mnt/media/abridged-movies",
+            "type": "movies",
+            "default_speed": "high",
+            "log_level": "info"
+        },
+        {
+            "input": "/mnt/media/toabridge-shows",
+            "output": "/mnt/media/abridged-shows",
+            "type": "shows",
+            "default_speed": "high",
+            "log_level": "info"
+        }
+    ]
+}
