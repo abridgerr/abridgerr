@@ -76,14 +76,22 @@ react to -- its QUIET_SECONDS timer still fires normally (it's just never
 retriggered), so it gets checked the same as any other file.
 
 Every file's own timer is independent, but actually RUNNING abridge.py is
-serialized process-wide via a single lock: several files going quiet at
-once (e.g. a whole season copied together) queue up and process strictly
+serialized process-wide through a single shared priority queue, drained by
+one dedicated worker thread: several files going quiet at once (e.g. a
+whole season copied together, or the initial startup scan of a folder
+that already has a season sitting in it) queue up and process strictly
 one at a time, the same guarantee a single-threaded poll loop gave for
 free -- deliberate, since concurrent encodes would contend for the same
-GPU/CPU encode resources.
+GPU/CPU encode resources. Priority-queued BY THE FILE'S OWN PATH, not
+arrival order, specifically so a batch that all become ready around the
+same moment processes in sorted order (S01E01 before S01E02 before ...)
+rather than whatever arbitrary order their independent timer threads
+happened to wake up in -- see process_queue_worker.
 """
+import itertools
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -412,9 +420,42 @@ def write_run_log(out_dir, stem, log_level, ok, output_text, elapsed_seconds):
     log_path.write_text(content)
 
 
-# Serializes actual abridge.py invocations process-wide -- see the module
-# docstring.
-processing_lock = threading.Lock()
+# All "file went quiet" events -- from the initial startup scan AND from
+# live filesystem events alike -- funnel into this one shared queue,
+# drained by a single dedicated worker thread (process_queue_worker)
+# rather than each debounce timer calling check_and_process_file directly
+# and racing every other ready timer for a lock. That race is what used
+# to make processing order effectively arbitrary: many per-file
+# threading.Timer threads with the same QUIET_SECONDS delay, all started
+# within the same tight startup loop, wake up within milliseconds of each
+# other -- CPython gives no ordering guarantee for who wins a contended
+# Lock, so a whole season's episodes (all becoming "quiet" and ready at
+# the same startup moment) previously processed in whatever arbitrary
+# order the OS happened to schedule their threads in. Priority-queued by
+# the file's own path string instead: a batch that all become ready
+# around the same time now always drains in sorted order (e.g. S01E01
+# before S01E02 before ... before S01E10), which is what actually matters
+# for someone wanting to start watching a show from the beginning while
+# later episodes are still being processed. The itertools.count()
+# tiebreaker exists only so heapq never has to fall back to comparing two
+# `pair` dicts (not orderable) -- str(path) is effectively always unique
+# in practice, so it's defensive, not load-bearing.
+_queue_tiebreak = itertools.count()
+processing_queue = queue.PriorityQueue()
+
+
+def process_queue_worker():
+    """The single consumer draining processing_queue -- see above for why
+    there's exactly one of these and not one per pair/timer. Runs for the
+    lifetime of the container (daemon thread, started once in main())."""
+    while True:
+        _, _, path, pair, min_free_gb = processing_queue.get()
+        try:
+            check_and_process_file(path, pair, min_free_gb)
+        except Exception as e:
+            log(f"[!] Unexpected error processing {path}: {e}")
+        finally:
+            processing_queue.task_done()
 
 # De-dupes the "no language available" log line per file, in-process only
 # (not persisted -- see the module docstring) so a file with no
@@ -431,86 +472,88 @@ def check_and_process_file(f, pair, min_free_gb):
     Safe to call for a file that's already fully processed (the common
     steady-state case): the existing-output check below is a cheap glob,
     so re-confirming "nothing to do" here costs nothing like spawning
-    abridge.py would."""
+    abridge.py would. Only ever called from process_queue_worker, which is
+    what actually provides the "one at a time, in sorted order" guarantee
+    -- see its docstring and processing_queue above; nothing in this
+    function itself is safe to call concurrently from multiple threads."""
     in_root, out_root = pair["input"], pair["output"]
-    with processing_lock:
-        try:
-            f.stat()
-        except OSError:
-            return  # gone by the time the timer fired -- e.g. deleted incomplete download, or a stale timer for an old path
+    try:
+        f.stat()
+    except OSError:
+        return  # gone by the time the timer fired -- e.g. deleted incomplete download, or a stale timer for an old path
 
-        rel_dir = f.parent.relative_to(in_root)
-        out_dir = out_root / rel_dir if str(rel_dir) != "." else out_root
+    rel_dir = f.parent.relative_to(in_root)
+    out_dir = out_root / rel_dir if str(rel_dir) != "." else out_root
 
-        # Cheap, direct filesystem check for an existing output -- avoids
-        # spawning a whole abridge.py subprocess (which itself runs
-        # ffprobe just to rebuild the output filename) for a file that's
-        # already fully done. A glob on the stem is enough --
-        # build_abridged_output_path always names it "<stem>-ABRIDGED<X>X"
-        # -- without duplicating abridge.py's own speed-suffix computation
-        # (which needs an ffprobe call) here at all. This stays a LIVE
-        # filesystem check rather than a cached "done" flag on purpose: if
-        # the output ever disappears (has happened once already, for
-        # reasons outside abridge.py itself), this naturally stops
-        # matching and the file gets rebuilt next time its timer fires.
-        if any(out_dir.glob(f"{f.stem}-ABRIDGED*")):
+    # Cheap, direct filesystem check for an existing output -- avoids
+    # spawning a whole abridge.py subprocess (which itself runs
+    # ffprobe just to rebuild the output filename) for a file that's
+    # already fully done. A glob on the stem is enough --
+    # build_abridged_output_path always names it "<stem>-ABRIDGED<X>X"
+    # -- without duplicating abridge.py's own speed-suffix computation
+    # (which needs an ffprobe call) here at all. This stays a LIVE
+    # filesystem check rather than a cached "done" flag on purpose: if
+    # the output ever disappears (has happened once already, for
+    # reasons outside abridge.py itself), this naturally stops
+    # matching and the file gets rebuilt next time its timer fires.
+    if any(out_dir.glob(f"{f.stem}-ABRIDGED*")):
+        return
+
+    if min_free_gb > 0:
+        free_gb = shutil_disk_free_gb(out_root)
+        if free_gb is not None and free_gb < min_free_gb:
+            log(f"[!] Only {free_gb:.1f}GB free at {out_root} (below "
+                f"min_free_gb={min_free_gb}) -- skipping {f} for now, will retry on its next event.")
             return
 
-        if min_free_gb > 0:
-            free_gb = shutil_disk_free_gb(out_root)
-            if free_gb is not None and free_gb < min_free_gb:
-                log(f"[!] Only {free_gb:.1f}GB free at {out_root} (below "
-                    f"min_free_gb={min_free_gb}) -- skipping {f} for now, will retry on its next event.")
-                return
+    entry = None
+    if pair["arr_url"]:
+        entry = resolve_arr_entry(pair["arr_type"], pair["arr_url"], pair["arr_api_key"], f)
 
-        entry = None
-        if pair["arr_url"]:
-            entry = resolve_arr_entry(pair["arr_type"], pair["arr_url"], pair["arr_api_key"], f)
+    if entry is not None and is_arr_failed(entry):
+        return  # already known-bad -- remove the abridgerr-failed tag in Radarr/Sonarr to retry
 
-        if entry is not None and is_arr_failed(entry):
-            return  # already known-bad -- remove the abridgerr-failed tag in Radarr/Sonarr to retry
+    speed_override = lang_override = None
+    if entry is not None:
+        speed_override, lang_override = resolve_arr_overrides(entry)
+    speed = speed_override or pair["default_speed"]
+    lang = lang_override
 
-        speed_override = lang_override = None
-        if entry is not None:
-            speed_override, lang_override = resolve_arr_overrides(entry)
-        speed = speed_override or pair["default_speed"]
-        lang = lang_override
+    if lang is None:
+        key = str(f)
+        with _warned_no_lang_lock:
+            already_warned = key in _warned_no_lang
+            _warned_no_lang.add(key)
+        if not already_warned:
+            log(f"[!] No language available for {f} -- no Radarr/Sonarr match (import it through "
+                f"Radarr's/Sonarr's dedicated toabridge root folder) or no original-language data, "
+                f"and no abridgerr-lang-<code> tag either. Skipping.")
+        return
 
-        if lang is None:
-            key = str(f)
-            with _warned_no_lang_lock:
-                already_warned = key in _warned_no_lang
-                _warned_no_lang.add(key)
-            if not already_warned:
-                log(f"[!] No language available for {f} -- no Radarr/Sonarr match (import it through "
-                    f"Radarr's/Sonarr's dedicated toabridge root folder) or no original-language data, "
-                    f"and no abridgerr-lang-<code> tag either. Skipping.")
-            return
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-        out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}, "
+        f"encoder={ENCODER}, video_codec={VIDEO_CODEC}): {f}")
+    # ENCODER/VIDEO_CODEC come before extra_args, not after: argparse
+    # keeps the LAST occurrence of a repeated flag, so a pair's own
+    # extra_args (e.g. ["--encoder", "cpu"] for one pair that needs to
+    # skip hardware encode) can still override these container-wide
+    # defaults on a per-pair basis.
+    cmd = ([sys.executable, "/app/abridge.py", str(f), str(out_dir),
+            "--speed", speed, "--lang", lang, "--embed-subs",
+            "--encoder", ENCODER, "--video-codec", VIDEO_CODEC] + pair["extra_args"])
+    start = time.monotonic()
+    returncode, output_text = run_abridge(cmd)
+    elapsed = time.monotonic() - start
+    write_run_log(out_dir, f.stem, pair["log_level"], returncode == 0, output_text, elapsed)
 
-        log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}, "
-            f"encoder={ENCODER}, video_codec={VIDEO_CODEC}): {f}")
-        # ENCODER/VIDEO_CODEC come before extra_args, not after: argparse
-        # keeps the LAST occurrence of a repeated flag, so a pair's own
-        # extra_args (e.g. ["--encoder", "cpu"] for one pair that needs to
-        # skip hardware encode) can still override these container-wide
-        # defaults on a per-pair basis.
-        cmd = ([sys.executable, "/app/abridge.py", str(f), str(out_dir),
-                "--speed", speed, "--lang", lang, "--embed-subs",
-                "--encoder", ENCODER, "--video-codec", VIDEO_CODEC] + pair["extra_args"])
-        start = time.monotonic()
-        returncode, output_text = run_abridge(cmd)
-        elapsed = time.monotonic() - start
-        write_run_log(out_dir, f.stem, pair["log_level"], returncode == 0, output_text, elapsed)
+    set_arr_failed_tag(pair["arr_type"], pair["arr_url"], pair["arr_api_key"], entry, returncode != 0)
 
-        set_arr_failed_tag(pair["arr_type"], pair["arr_url"], pair["arr_api_key"], entry, returncode != 0)
-
-        if returncode != 0:
-            log(f"[!] abridge.py failed on {f} (exit {returncode}, took {format_elapsed(elapsed)}) -- tagged "
-                f"{_ARR_FAILED_TAG} in {pair['arr_type']}, remove the tag there to retry.")
-        else:
-            log(f"Done: {f} (took {format_elapsed(elapsed)})")
+    if returncode != 0:
+        log(f"[!] abridge.py failed on {f} (exit {returncode}, took {format_elapsed(elapsed)}) -- tagged "
+            f"{_ARR_FAILED_TAG} in {pair['arr_type']}, remove the tag there to retry.")
+    else:
+        log(f"Done: {f} (took {format_elapsed(elapsed)})")
 
 
 class DebouncedPairWatcher(FileSystemEventHandler):
@@ -544,7 +587,7 @@ class DebouncedPairWatcher(FileSystemEventHandler):
     def _fire(self, path):
         with self._timers_lock:
             self._timers.pop(str(path), None)
-        check_and_process_file(path, self.pair, self.min_free_gb)
+        processing_queue.put((str(path), next(_queue_tiebreak), path, self.pair, self.min_free_gb))
 
     def on_any_event(self, event):
         path = getattr(event, "dest_path", None) or event.src_path
@@ -572,6 +615,8 @@ def main():
         arr_bit = f"{pair['arr_type']} @ {pair['arr_url']}" if pair["arr_url"] else "NO arr instance configured"
         log(f"  {pair['input']} -> {pair['output']}  [default_speed={pair['default_speed']}, "
             f"log_level={pair['log_level']}, {arr_bit}]")
+
+    threading.Thread(target=process_queue_worker, daemon=True).start()
 
     observers = []
     for pair in config["pairs"]:
