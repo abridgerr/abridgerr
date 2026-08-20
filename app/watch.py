@@ -41,7 +41,7 @@ output name on purpose: that suffix needs an ffprobe call abridge.py does
 internally to resolve (deliberately not duplicated here, see the existing-
 output glob check below), so the source stem is the only name known before
 the run even starts, success or failure alike. Each pair's "log_level"
-(error/debug/info/none, default "info") controls what gets written and
+(error/debug/info, default "error") controls what gets written and
 where -- "debug" writes a full per-file <stem>.log for every run;
 "error" writes one only for failures; "info" instead maintains one
 <out_dir>/summary.log with one short block per video (abridge.py's own
@@ -108,7 +108,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 KNOWN_PAIR_FIELDS = {"input", "output", "type", "default_speed", "log_level", "extra_args"}
-LOG_LEVELS = {"error", "debug", "info", "none"}
+LOG_LEVELS = {"error", "debug", "info"}
 
 # Container-wide (not per-pair) hardware-encoding choice, passed straight
 # through to every abridge.py invocation as --encoder/--video-codec -- see
@@ -164,10 +164,10 @@ def load_config(config_path):
         if "input" not in pair or "output" not in pair:
             log(f"[!] pairs[{i}] is missing 'input' or 'output' -- skipping this pair entirely.")
             continue
-        log_level = pair.get("log_level", "info")
+        log_level = pair.get("log_level", "error")
         if log_level not in LOG_LEVELS:
-            log(f"[!] pairs[{i}] has log_level={log_level!r}, expected one of {sorted(LOG_LEVELS)} -- using 'info'.")
-            log_level = "info"
+            log(f"[!] pairs[{i}] has log_level={log_level!r}, expected one of {sorted(LOG_LEVELS)} -- using 'error'.")
+            log_level = "error"
         parsed.append({
             "input": Path(pair["input"]),
             "output": Path(pair["output"]),
@@ -451,10 +451,12 @@ def update_folder_summary(out_dir, stem, entry_text):
 def write_run_log(out_dir, stem, log_level, ok, output_text, elapsed_seconds):
     """Writes whichever log artifacts this run's log_level calls for --
     see the module docstring's log_level breakdown:
-      - "none": nothing at all, per-file or per-folder.
-      - "debug": full per-file log (<out_dir>/<stem>.log), every run,
-        success or failure. No per-folder summary.
-      - "error": full per-file log, FAILURES ONLY. No per-folder summary.
+      - "error" (default): full per-file log (<out_dir>/<stem>.log),
+        FAILURES ONLY. No per-folder summary, nothing at all on success
+        -- the quiet default, since abridge.py already prints everything
+        to `docker logs` regardless of this setting.
+      - "debug": full per-file log, every run, success or failure. No
+        per-folder summary.
       - "info": a <out_dir>/summary.log entry every run (abridge.py's own
         summary block on success, a short FAILED pointer on failure)
         PLUS a full per-file log on failures specifically -- the detail

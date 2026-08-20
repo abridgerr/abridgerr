@@ -96,7 +96,7 @@ tag.
 | `pairs[].input` / `output` | Folders to watch / write results to (paths as seen *inside* the container). Subfolder structure is preserved. |
 | `pairs[].type` | `movies` or `shows` — selects the `RADARR_*` or `SONARR_*` env vars used to look up each file's title. |
 | `pairs[].default_speed` | `high`, `low`, or `dialog` — used when a title has no `abridgerr-speed-*` tag. Default `high`. |
-| `pairs[].log_level` | `none`, `error`, `info`, or `debug` — controls what gets logged next to the output, and where. `debug`: a full `<stem>.log` per video, every run. `error`: a full `<stem>.log`, failures only. `info` (default): one `summary.log` per folder with a short block per video (a `=== Summary ===` on success, a `FAILED` pointer on failure), plus a full `<stem>.log` just for failures. |
+| `pairs[].log_level` | `error`, `info`, or `debug` — controls what gets logged next to the output, and where. `error` (default): a full `<stem>.log` per video, failures only, nothing on success. `debug`: the same full `<stem>.log`, but for every run. `info`: one `summary.log` per folder with a short block per video (a `=== Summary ===` on success, a `FAILED` pointer on failure), plus a full `<stem>.log` just for failures. |
 | `pairs[].extra_args` | Optional list of extra CLI args passed straight through to `abridge.py`. |
 
 ## Environment variables
