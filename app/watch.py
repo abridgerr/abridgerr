@@ -41,9 +41,12 @@ output name on purpose: that suffix needs an ffprobe call abridge.py does
 internally to resolve (deliberately not duplicated here, see the existing-
 output glob check below), so the source stem is the only name known before
 the run even starts, success or failure alike. Each pair's "log_level"
-(error/debug/info/none, default "info") controls both whether a log gets
-written and how much of the run's output it contains -- see
-build_log_content.
+(error/debug/info/none, default "info") controls what gets written and
+where -- "debug" writes a full per-file <stem>.log for every run;
+"error" writes one only for failures; "info" instead maintains one
+<out_dir>/summary.log with one short block per video (abridge.py's own
+summary on success), falling back to a full per-file <stem>.log just for
+failures -- see write_run_log/build_detailed_log/build_summary_entry.
 
 Stability is a PER-FILE debounce timer (via the `watchdog` package for
 inotify events), not a periodic full-tree poll: every relevant event for a
@@ -368,56 +371,106 @@ def format_elapsed(seconds):
     return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
 
 
-def build_log_content(log_level, ok, output_text, elapsed_seconds):
-    """Returns the text to write for this run's log, or None to write
-    nothing at all (see write_run_log -- None also removes any stale log
-    left over from a previous run at that same path, so a log's mere
-    presence/absence always reflects the CURRENT run's outcome under the
-    CURRENT log_level, not a leftover from before either was changed).
-
-    - "none": never anything.
-    - "error": nothing on success; on failure, the same short excerpt as
-      "info" below.
-    - "info": the "=== Summary ===" block abridge.py already prints on
-      success (its own before/after duration breakdown) plus how long the
-      abridge.py subprocess itself actually ran for (elapsed_seconds --
-      NOT anything abridge.py prints itself, it has no way to know its own
-      wall-clock runtime). On failure, there's no summary block to extract
-      (the run never got that far), so this is the last ~15 lines of
-      output instead -- confirmed against every real failure mode hit
-      during development (multiple audio tracks, VC-1 decode errors, etc.)
-      that the actual reason is always in the last few lines, since
-      abridge.py's own error handling always prints it as close to last as
-      it gets.
-    - "debug": the complete captured output (this is what a prior version
-      of this project unconditionally wrote for every run), plus the same
-      elapsed-time line appended.
-    """
-    if log_level == "none":
-        return None
+def build_detailed_log(ok, output_text, elapsed_seconds):
+    """The complete captured ffmpeg/abridge.py output for one run, plus
+    how long the abridge.py subprocess itself actually ran for
+    (elapsed_seconds -- NOT anything abridge.py prints itself, it has no
+    way to know its own wall-clock runtime). Used for the per-file
+    <out_dir>/<stem>.log at "debug" level (every run) and at "info"/
+    "error" levels (failures only -- see write_run_log)."""
     took = f"Took {format_elapsed(elapsed_seconds)}."
-    if log_level == "debug":
-        return f"{output_text.rstrip()}\n\n{took}\n"
+    prefix = "" if ok else "FAILED. "
+    return f"{prefix}{output_text.rstrip()}\n\n{took}\n"
+
+
+def build_summary_entry(stem, ok, output_text, elapsed_seconds):
+    """One video's block for its folder's summary.log ("info" level
+    only): abridge.py's own "=== Summary ===" block on success (its own
+    before/after duration breakdown), or a short pointer at the per-file
+    detailed log on failure -- the actual failure detail lives THERE, not
+    duplicated here, so the folder log stays a scannable one-block-per-
+    video summary regardless of how noisy a given failure's output was.
+    Delimited with "##### stem #####" rather than reusing abridge.py's
+    own "=== Summary ===" marker -- deliberately a different, more
+    distinctive format, since the copied-in summary body itself contains
+    "=== Summary ===" and update_folder_summary needs a delimiter that
+    can never appear inside an entry's own content."""
+    took = f"Took {format_elapsed(elapsed_seconds)}."
     if not ok:
-        tail = "\n".join(output_text.strip().splitlines()[-15:])
-        return f"FAILED. {took}\n\n{tail}\n"
-    if log_level == "error":
-        return None
-    idx = output_text.find("=== Summary ===")
-    summary = output_text[idx:].rstrip() if idx != -1 else output_text.strip()
-    return f"{summary}\n\n{took}\n"
+        body = f"FAILED. {took} See {stem}.log for details."
+    else:
+        idx = output_text.find("=== Summary ===")
+        summary = output_text[idx:].rstrip() if idx != -1 else output_text.strip()
+        body = f"{summary}\n\n{took}"
+    return f"##### {stem} #####\n{body}\n\n"
+
+
+_SUMMARY_ENTRY_RE = re.compile(r"^##### (.+?) #####\n", re.MULTILINE)
+
+
+def update_folder_summary(out_dir, stem, entry_text):
+    """Inserts/replaces/removes one video's block in <out_dir>/summary.log
+    -- entry_text=None removes the block (this run's log_level isn't
+    "info", so it shouldn't have one). Rewritten as a whole (not
+    appended) so reprocessing a video replaces its old entry IN PLACE
+    rather than duplicating it or losing its position, while every OTHER
+    video's entry in the folder is preserved untouched -- existing
+    entries keep their original position, new ones are appended, so the
+    file ends up ordered by whenever each video was FIRST processed
+    (which, since watch.py now processes a ready batch in sorted path
+    order -- see processing_queue above -- means this file naturally
+    reads in episode order too). Written atomically (temp file + rename)
+    since a container kill/restart mid-write shouldn't corrupt every
+    other video's entry along with this one's."""
+    summary_path = out_dir / "summary.log"
+    entries, order = {}, []
+    if summary_path.exists():
+        content = summary_path.read_text()
+        matches = list(_SUMMARY_ENTRY_RE.finditer(content))
+        for i, m in enumerate(matches):
+            key = m.group(1)
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+            entries[key] = content[m.start():end]
+            order.append(key)
+    if entry_text is None:
+        entries.pop(stem, None)
+        if stem in order:
+            order.remove(stem)
+    else:
+        if stem not in entries:
+            order.append(stem)
+        entries[stem] = entry_text
+    if not entries:
+        summary_path.unlink(missing_ok=True)
+        return
+    tmp_path = summary_path.parent / (summary_path.name + ".tmp")
+    tmp_path.write_text("".join(entries[k] for k in order))
+    tmp_path.replace(summary_path)
 
 
 def write_run_log(out_dir, stem, log_level, ok, output_text, elapsed_seconds):
-    """One log file per processed mkv, living right next to its output
-    (<out_dir>/<stem>.log) -- see the module docstring for why it's named
-    after the source stem rather than the resolved output filename."""
-    log_path = out_dir / f"{stem}.log"
-    content = build_log_content(log_level, ok, output_text, elapsed_seconds)
-    if content is None:
-        log_path.unlink(missing_ok=True)
-        return
-    log_path.write_text(content)
+    """Writes whichever log artifacts this run's log_level calls for --
+    see the module docstring's log_level breakdown:
+      - "none": nothing at all, per-file or per-folder.
+      - "debug": full per-file log (<out_dir>/<stem>.log), every run,
+        success or failure. No per-folder summary.
+      - "error": full per-file log, FAILURES ONLY. No per-folder summary.
+      - "info": a <out_dir>/summary.log entry every run (abridge.py's own
+        summary block on success, a short FAILED pointer on failure)
+        PLUS a full per-file log on failures specifically -- the detail
+        the folder summary's pointer sends you to.
+    Both artifact kinds are always written OR removed for every run
+    (never left stale), so presence/absence always reflects the CURRENT
+    run's outcome under the CURRENT log_level -- not a leftover from a
+    prior run made under a different level or a different outcome."""
+    detail_path = out_dir / f"{stem}.log"
+    if log_level == "debug" or (log_level in ("error", "info") and not ok):
+        detail_path.write_text(build_detailed_log(ok, output_text, elapsed_seconds))
+    else:
+        detail_path.unlink(missing_ok=True)
+
+    entry = build_summary_entry(stem, ok, output_text, elapsed_seconds) if log_level == "info" else None
+    update_folder_summary(out_dir, stem, entry)
 
 
 # All "file went quiet" events -- from the initial startup scan AND from
