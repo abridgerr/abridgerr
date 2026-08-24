@@ -1524,7 +1524,27 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     # No -r here: ffmpeg rejects -r together with a non-CFR -fps_mode
     # ("contradictory") -- passthrough already trusts the filter graph's
     # own (already-exact, see above) PTS, so there's nothing for -r to add.
-    cmd += ["-fps_mode", "passthrough"]
+    #
+    # -video_track_timescale 60000, found necessary by direct testing
+    # AFTER the cfr->passthrough switch above: without -r, the mp4 muxer
+    # picks each segment's container timebase itself, heuristically, from
+    # whatever that segment's own filter chain happened to produce --
+    # confirmed directly (via --dump-segments) that this landed on 1/12000
+    # for decimate-strategy segments but 1/60000 for duplicate-strategy
+    # segments in the SAME run. Each segment's own self-reported duration
+    # was still individually correct either way, but concat's stream-copy
+    # (-c copy) doesn't reconcile differing input timebases -- it trusts
+    # each segment's own declared scale directly, so splicing a 1/12000
+    # segment next to a 1/60000 one corrupted the concatenated file's
+    # overall timing by roughly the ratio between them (confirmed: a real
+    # multi-segment run came out 1m38s of real content -> a reported
+    # 3m50s, not the correct ~46s -- content was fine, only the spliced
+    # timing was broken). Pinning every segment to the SAME explicit
+    # timescale, independent of -fps_mode, removes the mismatch at the
+    # source rather than trying to reconcile it after the fact at concat
+    # time. 60000 chosen to match the standard 60000/1001 target rate
+    # exactly (1 frame = 1001 ticks, no rounding).
+    cmd += ["-fps_mode", "passthrough", "-video_track_timescale", "60000"]
     expected_frames = None
     if not is_final_segment and source_fps_frac:
         # -fps_mode cfr, confirmed by direct testing, pads a couple of
