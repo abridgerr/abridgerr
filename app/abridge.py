@@ -1472,35 +1472,59 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
 
     vf = f"{prefix},{vf}" if vf else prefix
 
-    # -r <exact target> -fps_mode cfr, for ALL THREE strategies -- not
-    # optional, and NOT "-fps_mode passthrough". Two separate bugs were
-    # found and fixed here by direct testing, not by reasoning about it:
-    # (1) with NO explicit -fps_mode at all, ffmpeg's default output
-    #     frame-pacing silently DROPS the large majority of frames whenever
-    #     setpts has altered their timing (confirmed: a plain
-    #     setpts=0.2*PTS on its own dropped ~80% of frames in a controlled
-    #     test) -- independent of whether the filter graph computed
-    #     correct timestamps. This is what caused the catastrophic
-    #     duration/playback corruption reported after --high-speed-fraction
-    #     (decimate being the majority-share default turned it into a
-    #     whole-file problem).
-    # (2) "-fps_mode passthrough" looked like the fix for (1) -- correct
-    #     frame COUNTS -- but per-frame PTS inspection (sorted, to rule out
-    #     a decode-vs-display-order red herring) showed badly non-uniform
-    #     spacing: many frames sharing near-identical timestamps
-    #     (timebase-precision collisions) interleaved with large gaps.
-    #     Right frame count, wrong actual timing -- would still look like
-    #     erratic/stuttery playback. "-r <target> -fps_mode cfr" instead
-    #     RECOMPUTES onto a clean, explicit target grid rather than
-    #     trusting the filter graph's raw (timebase-limited) PTS values,
-    #     which a direct spacing check confirmed is uniform to within
-    #     microsecond-level rounding noise for all three strategies.
+    # -fps_mode passthrough, NOT "-r <target> -fps_mode cfr" -- this
+    # reverses an earlier decision (see git history), found wrong by
+    # direct A/B testing against real source content, not just reasoning
+    # about it. Three things were confirmed by frame-content diffing this
+    # cut_segment's own output against a ground-truth reference (every-Nth
+    # source frame extracted independently, no speed/rate filtering at
+    # all):
+    # (1) With NO explicit -fps_mode, ffmpeg's default output frame-pacing
+    #     silently DROPS the large majority of frames whenever setpts has
+    #     altered their timing (confirmed: a plain setpts=0.2*PTS on its
+    #     own dropped ~80% of frames in a controlled test) -- independent
+    #     of whether the filter graph computed correct timestamps. Still
+    #     true, still why -fps_mode is never omitted.
+    # (2) "-r <target> -fps_mode cfr" -- the previous choice here -- was
+    #     ALSO wrong, just less obviously: confirmed by diffing a long
+    #     (566-frame) decimated segment's actual output against ground
+    #     truth, frame by frame, that cfr silently drops/duplicates
+    #     roughly 1 frame in every 5 THROUGHOUT the segment (not just at
+    #     the tail) even though the upstream select/regen/framestep math
+    #     puts every frame's PTS exactly on the target grid already (by
+    #     construction -- see resolve_frame_rate_strategy). cfr's
+    #     nearest-slot resampling algorithm is sensitive to sub-microsecond
+    #     floating-point noise in those already-correct PTS values, and
+    #     round trips some frames into the wrong output slot. This is
+    #     silent: the TOTAL frame count still comes out exactly right
+    #     (compensating drops with duplicates elsewhere), which is all
+    #     verify_and_fix_frame_count (below) checks -- it's specifically
+    #     invisible to a count-only check. Confirmed reproducible
+    #     regardless of hardware vs software decode (rules out a decoder
+    #     quirk) and confirmed present in this real code path, not just an
+    #     isolated filter-string test.
+    # (3) The historical reason cfr was chosen over passthrough in the
+    #     first place (see git history) -- "badly non-uniform PTS
+    #     spacing" under passthrough -- does not reproduce now. That
+    #     finding predates settb=1/1000000 and regen_prefix (added later,
+    #     for the MKV ~1ms timebase jitter fix below); once frame PTS are
+    #     regenerated from each frame's own sequential index at
+    #     microsecond precision, passthrough's spacing was confirmed
+    #     uniform to within the same sub-microsecond noise cfr was
+    #     choking on -- imperceptibly small (nowhere near a frame period),
+    #     not the "many near-duplicate timestamps interleaved with large
+    #     gaps" originally found. Content-diffed clean against ground
+    #     truth: zero dropped or duplicated frames, for all three
+    #     strategies.
     cmd = ["ffmpeg", "-nostdin", "-y", "-copyts"] + global_args + decode_args + [
         "-ss", f"{ss_arg}"
     ] + t_args + ["-i", src] + map_args
     if vf:
         cmd += ["-vf", vf]
-    cmd += ["-r", fps_arg_str(target_fps), "-fps_mode", "cfr"]
+    # No -r here: ffmpeg rejects -r together with a non-CFR -fps_mode
+    # ("contradictory") -- passthrough already trusts the filter graph's
+    # own (already-exact, see above) PTS, so there's nothing for -r to add.
+    cmd += ["-fps_mode", "passthrough"]
     expected_frames = None
     if not is_final_segment and source_fps_frac:
         # -fps_mode cfr, confirmed by direct testing, pads a couple of
