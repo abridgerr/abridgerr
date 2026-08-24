@@ -1251,7 +1251,7 @@ def atempo_chain(speed):
     return ",".join(filters)
 
 
-def verify_and_fix_frame_count(seg_path, expected_frames):
+def verify_and_fix_frame_count(seg_path, expected_frames, video_track_timescale=None):
     """Verifies a cut segment's actual output frame count matches the exact
     value computed ahead of time (from pair-snapped source-frame counts),
     and corrects it if not -- deterministically, regardless of WHY it
@@ -1269,7 +1269,17 @@ def verify_and_fix_frame_count(seg_path, expected_frames):
     ever a handful of frames). Silently returns if ffprobe can't read the
     file or the counts already match; failures here are logged, not
     raised, since this is a correctness refinement on an already-usable
-    segment, not worth aborting the whole run over."""
+    segment, not worth aborting the whole run over.
+    video_track_timescale, when given, is passed straight through to
+    whichever ffmpeg remux this runs -- MUST be the same common_tb
+    cut_segment used to produce seg_path in the first place. Without it,
+    this remux gets its own independently-chosen (and different) default
+    timescale, silently reintroducing exactly the per-segment-timescale
+    concat corruption this same value was already added to cut_segment to
+    prevent -- confirmed directly: a duplicate-strategy segment that took
+    this correction path came out with a different time_base than its
+    neighbors even after cut_segment's own timescale fix, because this
+    function's remux wasn't told about it yet."""
     try:
         r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
                   "-show_entries", "stream=nb_frames", "-of", "csv=p=0", seg_path], capture=True)
@@ -1279,16 +1289,17 @@ def verify_and_fix_frame_count(seg_path, expected_frames):
     if actual == expected_frames:
         return
     tmp_path = seg_path + ".fixframes.mp4"
+    ts_args = ["-video_track_timescale", str(video_track_timescale)] if video_track_timescale else []
     try:
         if actual > expected_frames:
             cmd = ["ffmpeg", "-nostdin", "-y", "-i", seg_path,
-                   "-frames:v", str(expected_frames), "-c", "copy", tmp_path]
+                   "-frames:v", str(expected_frames), "-c", "copy"] + ts_args + [tmp_path]
         else:
             missing = expected_frames - actual
             cmd = ["ffmpeg", "-nostdin", "-y", "-i", seg_path,
                    "-vf", f"tpad=stop_mode=clone:stop={missing}",
                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-bf", "0",
-                   "-c:a", "copy", tmp_path]
+                   "-c:a", "copy"] + ts_args + [tmp_path]
         r = run(cmd)
         if r.returncode == 0:
             os.replace(tmp_path, seg_path)
@@ -1449,8 +1460,33 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     # timestamps to decide WHICH frames belong in this segment -- only the
     # frames' OWN reported timing, not their inclusion/exclusion, gets
     # discarded and regenerated.
+    # common_tb: a timebase where BOTH the source's frame period AND the
+    # target's frame period land on exact integer tick counts -- not just
+    # "fine enough" (microsecond) precision, but genuinely exact, no
+    # rounding at all. Needed after switching cut_segment's final step
+    # from "-r target -fps_mode cfr" to "-fps_mode passthrough" (see
+    # below): passthrough trusts whatever PTS this filter chain hands it,
+    # with no CFR resampling left to paper over rounding drift. At plain
+    # microsecond precision (settb=1/1000000, the previous fixed value),
+    # 1001/60000s (the true NTSC target period) is 16683.3333...
+    # microseconds -- NOT an integer -- so every single frame's PTS
+    # carried a small, systematic rounding residue. Confirmed directly
+    # this residue is what caused the deployed output's packet durations
+    # to come out lumpy (four ~1-tick packets then one ~5001-tick packet,
+    # repeating every 5 frames, at the muxer's 60000 timescale) even
+    # though total duration and frame content were both already correct
+    # by that point. cross-multiplying the two rates' numerators
+    # (source_fps_frac.numerator * target's) guarantees both periods are
+    # exact integers at this timebase, for ANY source/target rate pair,
+    # not just the standard NTSC one -- the standard textbook trick for
+    # finding a common denominator between two rates.
+    if target_fps:
+        _target_frac = target_fps_fraction(target_fps)
+        common_tb = source_fps_frac.numerator * _target_frac.numerator
+    else:
+        common_tb = 1000000
     regen_prefix = f"setpts=N/({float(source_fps_frac)}*TB)"
-    select_prefix = f"settb=1/1000000,{select_expr},setpts=PTS-STARTPTS,{regen_prefix}"
+    select_prefix = f"settb=1/{common_tb},{select_expr},setpts=PTS-STARTPTS,{regen_prefix}"
     prefix_parts = [select_prefix] + ([rate_prefix] if rate_prefix else [])
     prefix = ",".join(prefix_parts)
     if debug_speed_overlay:
@@ -1475,10 +1511,11 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     # -fps_mode passthrough, NOT "-r <target> -fps_mode cfr" -- this
     # reverses an earlier decision (see git history), found wrong by
     # direct A/B testing against real source content, not just reasoning
-    # about it. Three things were confirmed by frame-content diffing this
+    # about it, across three rounds of "fix one thing, discover the fix
+    # exposed/caused another" -- each confirmed by frame-content diffing
     # cut_segment's own output against a ground-truth reference (every-Nth
     # source frame extracted independently, no speed/rate filtering at
-    # all):
+    # all), not by reasoning about the filter graph in the abstract:
     # (1) With NO explicit -fps_mode, ffmpeg's default output frame-pacing
     #     silently DROPS the large majority of frames whenever setpts has
     #     altered their timing (confirmed: a plain setpts=0.2*PTS on its
@@ -1503,19 +1540,49 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     #     regardless of hardware vs software decode (rules out a decoder
     #     quirk) and confirmed present in this real code path, not just an
     #     isolated filter-string test.
-    # (3) The historical reason cfr was chosen over passthrough in the
-    #     first place (see git history) -- "badly non-uniform PTS
-    #     spacing" under passthrough -- does not reproduce now. That
-    #     finding predates settb=1/1000000 and regen_prefix (added later,
-    #     for the MKV ~1ms timebase jitter fix below); once frame PTS are
-    #     regenerated from each frame's own sequential index at
-    #     microsecond precision, passthrough's spacing was confirmed
-    #     uniform to within the same sub-microsecond noise cfr was
-    #     choking on -- imperceptibly small (nowhere near a frame period),
-    #     not the "many near-duplicate timestamps interleaved with large
-    #     gaps" originally found. Content-diffed clean against ground
-    #     truth: zero dropped or duplicated frames, for all three
-    #     strategies.
+    # (3) Switching straight to passthrough (no other change) traded that
+    #     bug for two new ones, both confirmed on a real multi-segment
+    #     run, not just an isolated single segment:
+    #     (a) Concat corruption -- without -r, the mp4 muxer picked each
+    #         segment's OWN container timescale heuristically from
+    #         whatever its filter chain produced (confirmed via
+    #         --dump-segments: 1/12000 for decimate segments, 1/60000 for
+    #         duplicate segments, in the SAME run), and stream-copy concat
+    #         doesn't reconcile differing input timescales -- splicing a
+    #         1/12000 segment next to a 1/60000 one threw the concatenated
+    #         file's overall duration off by roughly their ratio
+    #         (confirmed: a real 1m38s-of-content run came out reporting
+    #         3m50s; a full 48-minute episode came out 140 minutes). Fixed
+    #         by -video_track_timescale, below, using the SAME common_tb
+    #         (an exact, not just fine-grained, shared timebase --
+    #         cross-multiplying the source and target rates' numerators
+    #         so both periods land on whole ticks with zero rounding, for
+    #         any source/target pair) on every segment, so concat always
+    #         sees matching timescales.
+    #     (b) Pacing corruption -- fixing (a) alone was NOT enough:
+    #         packet-level inspection of a real deployed file (not just
+    #         ffprobe's decoded-frame view, which can mask this) showed
+    #         every 5th frame absorbing nearly the entire 5-frame span's
+    #         duration while the other 4 shared its exact PTS (0 ticks
+    #         apart) -- correct total timing and correct frame content/
+    #         order, but any player honoring those timestamps would show
+    #         4 frames flash by simultaneously then hold for 5 frame-
+    #         periods, repeating throughout. This was NOT a timebase
+    #         precision issue (reproduced identically even with common_tb
+    #         giving exact, zero-rounding ticks) -- root cause is the
+    #         ENCODER choosing its OWN internal timebase heuristically
+    #         when none is given explicitly (historically -r's job),
+    #         independent of what the filter graph or -video_track_
+    #         timescale declare, and rebasing incoming frame PTS onto
+    #         that mismatched grid. -enc_time_base -1, below, forces the
+    #         encoder to use the filter graph's OWN timebase instead of
+    #         guessing -- confirmed directly this alone fixes the
+    #         clustering (perfectly uniform PTS afterward), independent
+    #         of and in addition to the concat fix in (a). Re-verified
+    #         content-clean against ground truth AND pacing-clean at the
+    #         packet level after both fixes, for all three speed
+    #         strategies and confirmed on the actual QSV hardware encoder
+    #         used in production (not just the libx264 fallback).
     cmd = ["ffmpeg", "-nostdin", "-y", "-copyts"] + global_args + decode_args + [
         "-ss", f"{ss_arg}"
     ] + t_args + ["-i", src] + map_args
@@ -1524,27 +1591,16 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     # No -r here: ffmpeg rejects -r together with a non-CFR -fps_mode
     # ("contradictory") -- passthrough already trusts the filter graph's
     # own (already-exact, see above) PTS, so there's nothing for -r to add.
-    #
-    # -video_track_timescale 60000, found necessary by direct testing
-    # AFTER the cfr->passthrough switch above: without -r, the mp4 muxer
-    # picks each segment's container timebase itself, heuristically, from
-    # whatever that segment's own filter chain happened to produce --
-    # confirmed directly (via --dump-segments) that this landed on 1/12000
-    # for decimate-strategy segments but 1/60000 for duplicate-strategy
-    # segments in the SAME run. Each segment's own self-reported duration
-    # was still individually correct either way, but concat's stream-copy
-    # (-c copy) doesn't reconcile differing input timebases -- it trusts
-    # each segment's own declared scale directly, so splicing a 1/12000
-    # segment next to a 1/60000 one corrupted the concatenated file's
-    # overall timing by roughly the ratio between them (confirmed: a real
-    # multi-segment run came out 1m38s of real content -> a reported
-    # 3m50s, not the correct ~46s -- content was fine, only the spliced
-    # timing was broken). Pinning every segment to the SAME explicit
-    # timescale, independent of -fps_mode, removes the mismatch at the
-    # source rather than trying to reconcile it after the fact at concat
-    # time. 60000 chosen to match the standard 60000/1001 target rate
-    # exactly (1 frame = 1001 ticks, no rounding).
-    cmd += ["-fps_mode", "passthrough", "-video_track_timescale", "60000"]
+    # -video_track_timescale uses the SAME common_tb as settb above (not
+    # a separate hardcoded value) so every segment's container declares
+    # an identical, exact timescale regardless of which strategy or
+    # encoder produced it -- see (3)(a) above. -enc_time_base -1 forces
+    # the ENCODER (a separate stage from the muxer) to also use the
+    # filter graph's own timebase instead of guessing its own -- see
+    # (3)(b) above; without it, -video_track_timescale alone is not
+    # sufficient.
+    cmd += ["-fps_mode", "passthrough", "-video_track_timescale", str(common_tb),
+            "-enc_time_base", "-1"]
     expected_frames = None
     if not is_final_segment and source_fps_frac:
         # -fps_mode cfr, confirmed by direct testing, pads a couple of
@@ -1607,7 +1663,7 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
         raise RuntimeError(f"ffmpeg failed on segment {start}-{end}:\n{r.stderr[-2000:]}")
 
     if expected_frames is not None:
-        verify_and_fix_frame_count(out_path, expected_frames)
+        verify_and_fix_frame_count(out_path, expected_frames, video_track_timescale=common_tb)
 
 
 class TimeMapper:
