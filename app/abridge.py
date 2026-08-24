@@ -1602,26 +1602,48 @@ def cut_segment(src, start, end, out_path, reencode, speed=1.0, encoder_mode="cp
     cmd += ["-fps_mode", "passthrough", "-video_track_timescale", str(common_tb),
             "-enc_time_base", "-1"]
     expected_frames = None
-    if not is_final_segment and source_fps_frac:
-        # -fps_mode cfr, confirmed by direct testing, pads a couple of
-        # extra duplicate frames at the tail beyond the filtered content's
-        # actual end -- reproducible regardless of -ss/-t padding (tested
-        # down to zero and even negative slack, same +2 every time), so
-        # it's CFR's own stream-ending behavior, not a symptom of our seek
-        # padding. Since segments are snapped to the native frame grid
-        # (pairs, even), the exact correct output frame count is known
-        # ahead of time and enforced directly with -frames:v, closing this
-        # off regardless of CFR's internal cause. Skipped for the final
-        # segment: it has no upper time bound by design (extends to the
-        # true end of the source), so there's no independently-computable
-        # expected count to enforce without risking truncating real content.
+    if not is_final_segment and source_fps_frac and strategy == "duplicate":
+        # -fps_mode cfr, confirmed by direct testing, used to pad a couple
+        # of extra duplicate frames at the tail beyond the filtered
+        # content's actual end -- reproducible regardless of -ss/-t
+        # padding (tested down to zero and even negative slack, same +2
+        # every time), so it was CFR's own stream-ending behavior, not a
+        # symptom of our seek padding. That's gone now (see the passthrough
+        # switch above), but duplicate's OWN rate-conversion approach
+        # (fps= filter at double rate, then framestep=2 -- see the
+        # "duplicate" branch above) still has its own separate, smaller
+        # shortfall tendency, confirmed directly in a controlled test (122
+        # vs an expected 124) -- unrelated to CFR, still real, still needs
+        # padding. -frames:v/verify_and_fix_frame_count (below) still
+        # exist for that.
+        #
+        # NOT applied for decimate or passthrough anymore: confirmed by
+        # direct testing that n_source_frames (the formula below) can
+        # legitimately UNDER-count by exactly 1 relative to what `select`
+        # actually captures, because real source files have genuine
+        # sub-native-period timestamp jitter (the same MKV jitter
+        # regen_prefix exists to correct for FRAME PACING) -- occasionally
+        # the boundary-adjacent frame's real decoded timestamp lands just
+        # inside this segment's window even though the idealized
+        # start/end math (computed from the snapped, jitter-free grid)
+        # suggests it should be exactly ON the boundary. Confirmed
+        # directly: a real segment's `select` naturally captured 1135
+        # native frames where round(duration*fps) predicted 1134 --
+        # decimate's own math (keep every Nth, framestep -- exact by
+        # construction, no historical need for padding at all) then
+        # naturally produces 568 frames where the OLD formula-capped
+        # -frames:v enforced exactly 567, silently discarding one
+        # correctly-selected frame right at the segment's tail. That
+        # frame wasn't extra or wrong -- cutting it left a real ~5-frame-
+        # period hold on the previous frame before the next segment
+        # began (confirmed via packet-level PTS inspection of a real
+        # deployed file). decimate and passthrough are both exact by
+        # construction now (extensively verified against ground truth
+        # elsewhere in this file's history) -- trusting their natural
+        # output is more correct than a pre-computed estimate that can't
+        # see the real source's own timestamp jitter.
         n_source_frames = round((end - start) * float(source_fps_frac))
-        if strategy == "decimate":
-            expected_frames = n_source_frames // strategy_n
-        elif strategy == "duplicate":
-            expected_frames = n_source_frames * strategy_n
-        else:
-            expected_frames = n_source_frames
+        expected_frames = n_source_frames * strategy_n
         cmd += ["-frames:v", str(expected_frames)]
     cmd += codec_args
     if audio_stream_index is not None:
