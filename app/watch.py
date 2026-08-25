@@ -8,19 +8,20 @@ file has gone QUIET_SECONDS with no further filesystem events touching it
 paused), runs abridge.py against it, writing output into the corresponding
 output folder with the same subfolder structure preserved.
 
-Each pair's speed and language come from Radarr/Sonarr, not static config:
-every pair has a "type" ("movies" or "shows"), which selects the matching
-RADARR_URL/RADARR_API_KEY or SONARR_URL/SONARR_API_KEY env var pair (see
-compose.yml). For a given file, the movie/series owning it (matched by
-folder path) supplies the language via its own originalLanguage, and both
-speed and language can be overridden per-title with an
-abridgerr-speed-<high|low|dialog> or abridgerr-lang-<code> tag in
-Radarr's/Sonarr's UI -- see resolve_arr_overrides. A pair's own
-"default_speed" (falls back to "high") is only used when no speed tag is
-present; there is no equivalent static fallback for language anymore -- a
-file with no Radarr/Sonarr match and no original-language data simply can't
-be processed (see check_and_process_file) until it's actually imported
-through Radarr's/Sonarr's dedicated toabridge root folder.
+Each pair's speed, language, and log_level come from Radarr/Sonarr, not
+static config: every pair has a "type" ("movies" or "shows"), which selects
+the matching RADARR_URL/RADARR_API_KEY or SONARR_URL/SONARR_API_KEY env var
+pair (see compose.yml). For a given file, the movie/series owning it
+(matched by folder path) supplies the language via its own originalLanguage,
+and speed/language/log_level can each be overridden per-title with an
+abridgerr-speed-<high|low|dialog>, abridgerr-lang-<code>, or
+abridgerr-loglevel-<error|debug|info> tag in Radarr's/Sonarr's UI -- see
+resolve_arr_overrides. A pair's own "default_speed" (falls back to "high")
+and "log_level" (falls back to "error") are only used when the matching tag
+isn't present; there is no equivalent static fallback for language anymore
+-- a file with no Radarr/Sonarr match and no original-language data simply
+can't be processed (see check_and_process_file) until it's actually
+imported through Radarr's/Sonarr's dedicated toabridge root folder.
 
 A file abridge.py fails on gets tagged abridgerr-failed on its Radarr/Sonarr
 entry directly (see set_arr_failed_tag) rather than remembered in a local
@@ -130,6 +131,7 @@ ARR_ENV_BY_TYPE = {
 
 _ARR_SPEED_TAG_RE = re.compile(r"^abridgerr-speed-(high|low|dialog)$", re.IGNORECASE)
 _ARR_LANG_TAG_RE = re.compile(r"^abridgerr-lang-([a-z]{2,3})$", re.IGNORECASE)
+_ARR_LOGLEVEL_TAG_RE = re.compile(r"^abridgerr-loglevel-(debug|error|info)$", re.IGNORECASE)
 _ARR_FAILED_TAG = "abridgerr-failed"
 
 # How long a file must go with NO further filesystem events before it's
@@ -265,15 +267,17 @@ def resolve_arr_entry(arr_type, arr_url, arr_api_key, file_path):
 
 
 def resolve_arr_overrides(entry):
-    """(speed_override, lang_override) from an already-matched entry's
-    tag_labels + originalLanguage -- see resolve_arr_entry.
+    """(speed_override, lang_override, loglevel_override) from an already-
+    matched entry's tag_labels + originalLanguage -- see resolve_arr_entry.
     abridgerr-speed-<mode> overrides the pair's own default_speed;
     abridgerr-lang-<code> overrides the language, and absent that tag, the
     entry's own originalLanguage becomes the language instead (via
     babelfish -- confirmed "English" -> alpha3 "eng" against the real API
-    response shape). Either comes back None if not determinable -- callers
-    fall back to their own default (speed) or treat it as unresolvable
-    (lang, which has no static fallback)."""
+    response shape); abridgerr-loglevel-<level> overrides the pair's own
+    log_level (one of LOG_LEVELS -- same three values, no separate list to
+    keep in sync). Each comes back None if not determinable -- callers
+    fall back to their own default (speed, log_level) or treat it as
+    unresolvable (lang, which has no static fallback)."""
     labels = entry["tag_labels"]
     title = entry.get("title", "?")
 
@@ -299,7 +303,14 @@ def resolve_arr_overrides(entry):
             except Exception:
                 pass
 
-    return speed_override, lang_override
+    loglevel_matches = [m.group(1).lower() for l in labels if (m := _ARR_LOGLEVEL_TAG_RE.match(l))]
+    loglevel_override = None
+    if len(loglevel_matches) == 1:
+        loglevel_override = loglevel_matches[0]
+    elif len(loglevel_matches) > 1:
+        log(f"[!] {title!r} has conflicting log-level tags {loglevel_matches} -- using the pair's log_level instead.")
+
+    return speed_override, lang_override, loglevel_override
 
 
 def is_arr_failed(entry):
@@ -568,11 +579,12 @@ def check_and_process_file(f, pair, min_free_gb):
     if entry is not None and is_arr_failed(entry):
         return  # already known-bad -- remove the abridgerr-failed tag in Radarr/Sonarr to retry
 
-    speed_override = lang_override = None
+    speed_override = lang_override = loglevel_override = None
     if entry is not None:
-        speed_override, lang_override = resolve_arr_overrides(entry)
+        speed_override, lang_override, loglevel_override = resolve_arr_overrides(entry)
     speed = speed_override or pair["default_speed"]
     lang = lang_override
+    log_level = loglevel_override or pair["log_level"]
 
     if lang is None:
         key = str(f)
@@ -587,7 +599,7 @@ def check_and_process_file(f, pair, min_free_gb):
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}, "
+    log(f"Processing (quiet {QUIET_SECONDS:.0f}s, speed={speed}, lang={lang}, log_level={log_level}, "
         f"encoder={ENCODER}, video_codec={VIDEO_CODEC}): {f}")
     # ENCODER/VIDEO_CODEC come before extra_args, not after: argparse
     # keeps the LAST occurrence of a repeated flag, so a pair's own
@@ -600,7 +612,7 @@ def check_and_process_file(f, pair, min_free_gb):
     start = time.monotonic()
     returncode, output_text = run_abridge(cmd)
     elapsed = time.monotonic() - start
-    write_run_log(out_dir, f.stem, pair["log_level"], returncode == 0, output_text, elapsed)
+    write_run_log(out_dir, f.stem, log_level, returncode == 0, output_text, elapsed)
 
     set_arr_failed_tag(pair["arr_type"], pair["arr_url"], pair["arr_api_key"], entry, returncode != 0)
 
