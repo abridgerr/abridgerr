@@ -1,4 +1,4 @@
-# abridgerr
+# Abridgerr
 
 Watches a folder for `.mkv` files and re-encodes each one onto a fixed
 59.94fps (60000/1001) timeline, speeding up dialog and non-dialog stretches
